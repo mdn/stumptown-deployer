@@ -1,27 +1,32 @@
-import datetime
-import os
-import time
-import getpass
-import shutil
-import mimetypes
-from pathlib import Path
 import concurrent.futures
+import datetime
+import getpass
+import hashlib
+import mimetypes
+import os
+import re
+import shutil
+import time
+from pathlib import Path
 
 import boto3
 import git
-
 from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 from git.exc import InvalidGitRepositoryError
 
 from .constants import (
     AWS_PROFILE,
+    DEFAULT_CACHE_CONTROL,
     DEFAULT_NAME_PATTERN,
-    S3_DEFAULT_BUCKET_LOCATION,
+    HASHED_CACHE_CONTROL,
     MAX_WORKERS_PARALLEL_UPLOADS,
+    S3_DEFAULT_BUCKET_LOCATION,
 )
 from .exceptions import NoGitDirectory
-from .utils import info, is_junk_file, ppath, success, warning, fmt_size, fmt_seconds
+from .utils import fmt_seconds, fmt_size, info, is_junk_file, ppath, success, warning
+
+hashed_filename_regex = re.compile(r"\.[a-f0-9]{8,32}\.")
 
 
 def center(msg):
@@ -125,40 +130,94 @@ def upload_site(directory, config):
 
         warning(f"{len(uploaded_already):,} files already uploaded.")
 
+    def has_hashed_filename(fn):
+        return hashed_filename_regex.findall(os.path.basename(fn))
+
     transfer_config = TransferConfig()
     skipped = []
 
-    to_upload = []
+    to_upload_maybe = []
+    to_upload_definitely = []
     for fp in directory.glob("**/*.*"):
         key = str(fp.relative_to(directory))
         name = str(fp)
         size = os.stat(fp).st_size
-        task = (key, name, size)
+        with open(fp, "rb") as f:
+            file_hash = hashlib.md5(f.read()).hexdigest()
+        task = (key, name, size, file_hash)
         if is_junk_file(fp):
             skipped.append(task)
             continue
 
         if key not in uploaded_already or uploaded_already[key]["Size"] != size:
-            to_upload.append((key, name, size))
+            # No doubt! We definitely didn't have this before or it's definitely
+            # different.
+            to_upload_definitely.append(task)
         else:
-            skipped.append(task)
+            # At this point, the key exists and the size hasn't changed.
+            # However, for some files, that's not conclusive.
+            # Image, a 'index.html' file might have this as its diff:
+            #
+            #    - <script src=/foo.a9bef19a0.js></script>
+            #    + <script src=/foo.3e98ca01d.js></script>
+            #
+            # ...which means it definitely has changed but the file size is
+            # exactly the same as before.
+            # If this is the case, we're going to *maybe* upload it.
+            # However, for files that are already digest hashed, we don't need
+            # to bother checking.
+            if has_hashed_filename(key):
+                skipped.append(task)
+            else:
+                to_upload_maybe.append(task)
 
-    def _upload_file(s3, filepath, size, bucket_name, object_name, global_progress):
+    def _upload_file_maybe(
+        s3, object_name, filepath, size, file_hash, bucket_name, check_hash_first=False
+    ):
         t0 = time.time()
+        # At this point, we still don't know if we should bother uploading this.
+        # The explanation for being here is either
+        # First, assume that it led to an upload
+        if check_hash_first:
+            object_data = s3.head_object(Bucket=bucket_name, Key=object_name)
+            if object_data["Metadata"].get("filehash") == file_hash:
+                # We can bail early!
+                t1 = time.time()
+                info(
+                    f"Skipped "
+                    f"{object_name} ({fmt_size(size)}) in {fmt_seconds(t1 - t0)}"
+                )
+                return False, t1 - t0
+
         mime_type = mimetypes.guess_type(filepath)[0] or "binary/octet-stream"
-        # print(os.path.basename(filepath), "-->", mime_type)
+
+        if os.path.basename(filepath) == "service-worker.js":
+            cache_control = "no-cache"
+        else:
+            cache_control_seconds = DEFAULT_CACHE_CONTROL
+            if has_hashed_filename(filepath):
+                cache_control_seconds = HASHED_CACHE_CONTROL
+            cache_control = f"max-age={cache_control_seconds}, public"
+
         s3.upload_file(
             filepath,
             config["name"],
             object_name,
-            ExtraArgs={"ACL": "public-read", "ContentType": mime_type},
+            ExtraArgs={
+                "ACL": "public-read",
+                "ContentType": mime_type,
+                "CacheControl": cache_control,
+                "Metadata": {"filehash": file_hash},
+            },
             Config=transfer_config,
         )
         t1 = time.time()
-        info(f"Uploaded {object_name} ({fmt_size(size)}) in {fmt_seconds(t1 - t0)}")
-        return t1 - t0
+        info(
+            f"{'Updated' if check_hash_first else 'Uploaded'} "
+            f"{object_name} ({fmt_size(size)}) in {fmt_seconds(t1 - t0)}"
+        )
+        return True, t1 - t0
 
-    global_progress = {}
     T0 = time.time()
     futures = {}
     total_threadpool_time = []
@@ -166,41 +225,73 @@ def upload_site(directory, config):
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=MAX_WORKERS_PARALLEL_UPLOADS
     ) as executor:
-        info(f"About to upload {len(to_upload):,} files")
-        for key, filepath, size in to_upload:
+        info(
+            "About to upload "
+            f"{len(to_upload_maybe) + len(to_upload_definitely):,} files"
+        )
+        # XXX avoid two loops!
+        for key, filepath, size, file_hash in to_upload_definitely:
             futures[
                 executor.submit(
-                    _upload_file,
+                    _upload_file_maybe,
                     s3,
+                    key,
                     filepath,
                     size,
+                    file_hash,
                     config["name"],
-                    key,
-                    global_progress,
+                    False,
                 )
-            ] = (key, filepath, size)
+            ] = (key, filepath, size, file_hash)
+        for key, filepath, size, file_hash in to_upload_maybe:
+            futures[
+                executor.submit(
+                    _upload_file_maybe,
+                    s3,
+                    key,
+                    filepath,
+                    size,
+                    file_hash,
+                    config["name"],
+                    True,
+                )
+            ] = (key, filepath, size, file_hash)
 
         for future in concurrent.futures.as_completed(futures):
-            took = future.result()
+            was_uploaded, took = future.result()
             task = futures[future]
-            uploaded[task] = took
+            uploaded[task] = (was_uploaded, took)
             total_threadpool_time.append(took)
 
     T1 = time.time()
 
-    if skipped:
-        warning(f"Skipped uploading {len(skipped):,} files")
+    actually_uploaded = [k for k, v in uploaded.items() if v[0]]
+    actually_skipped = [k for k, v in uploaded.items() if not v[0]]
+
+    if skipped or actually_skipped:
+        warning(f"Skipped uploading {len(skipped) + len(actually_skipped):,} files")
 
     if uploaded:
-        total_uploaded_size = sum([x[2] for x in uploaded])
-        success(
-            f"Uploaded {len(uploaded):,} files "
-            f"(totalling {fmt_size(total_uploaded_size)}) "
-            f"in {fmt_seconds(T1 - T0)} "
-            f"(~{fmt_size(total_uploaded_size / 60)}/s)"
-        )
+        if actually_uploaded:
+            total_uploaded_size = sum([x[2] for x in actually_uploaded])
+            success(
+                f"Uploaded {len(actually_uploaded):,} "
+                f"{'file' if len(actually_uploaded) == 1 else 'files'} "
+                f"(totalling {fmt_size(total_uploaded_size)}) "
+                f"(~{fmt_size(total_uploaded_size / 60)}/s)"
+            )
+        # if actually_skipped:
+        #     total_skipped_size = sum([x[2] for x in actually_skipped])
+        #     success(
+        #         f"Skipped {len(actually_skipped):,} files "
+        #         f"(totalling {fmt_size(total_skipped_size)}) "
+        #         f"thanks to hash checking."
+        #     )
+
         if total_threadpool_time:
             info(
                 "Sum of time to upload in thread pool "
                 f"{fmt_seconds(sum(total_threadpool_time))}"
             )
+
+    success(f"Done in {fmt_seconds(T1 - T0)}")
