@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import boto3
@@ -43,6 +44,23 @@ def _find_git_repo(start):
         return _find_git_repo(Path(start).parent)
 
 
+def _has_hashed_filename(fn):
+    return hashed_filename_regex.findall(os.path.basename(fn))
+
+
+@dataclass(unsafe_hash=True)
+class UploadTask:
+    """All the relevant information for doing an upload"""
+
+    key: str
+    file_path: str
+    size: int
+    file_hash: str
+
+    def __repr__(self):
+        return repr(self.key)
+
+
 def upload_site(directory, config):
     if isinstance(directory, str):
         directory = Path(directory)
@@ -68,11 +86,6 @@ def upload_site(directory, config):
     # First make sure the bucket exists
     try:
         s3.head_bucket(Bucket=config["name"])
-        # # print("BUCKET;;", repr(bucket), type(bucket))
-        # bucket_policy = s3.get_bucket_acl(Bucket=config["name"])
-        # info(f"Bucket policy: {bucket_policy}")
-        # if config["debug"]:
-        #     info(f"Bucket policy: {bucket_policy}")
     except ClientError as error:
         # If a client error is thrown, then check that it was a 404 error.
         # If it was a 404 error, then the bucket does not exist.
@@ -130,9 +143,6 @@ def upload_site(directory, config):
 
         warning(f"{len(uploaded_already):,} files already uploaded.")
 
-    def has_hashed_filename(fn):
-        return hashed_filename_regex.findall(os.path.basename(fn))
-
     transfer_config = TransferConfig()
     skipped = []
 
@@ -140,11 +150,11 @@ def upload_site(directory, config):
     to_upload_definitely = []
     for fp in directory.glob("**/*.*"):
         key = str(fp.relative_to(directory))
-        name = str(fp)
+        # name = str(fp)
         size = os.stat(fp).st_size
         with open(fp, "rb") as f:
             file_hash = hashlib.md5(f.read()).hexdigest()
-        task = (key, name, size, file_hash)
+        task = UploadTask(key, str(fp), size, file_hash)
         if is_junk_file(fp):
             skipped.append(task)
             continue
@@ -166,57 +176,10 @@ def upload_site(directory, config):
             # If this is the case, we're going to *maybe* upload it.
             # However, for files that are already digest hashed, we don't need
             # to bother checking.
-            if has_hashed_filename(key):
+            if _has_hashed_filename(key):
                 skipped.append(task)
             else:
                 to_upload_maybe.append(task)
-
-    def _upload_file_maybe(
-        s3, object_name, filepath, size, file_hash, bucket_name, check_hash_first=False
-    ):
-        t0 = time.time()
-        # At this point, we still don't know if we should bother uploading this.
-        # The explanation for being here is either
-        # First, assume that it led to an upload
-        if check_hash_first:
-            object_data = s3.head_object(Bucket=bucket_name, Key=object_name)
-            if object_data["Metadata"].get("filehash") == file_hash:
-                # We can bail early!
-                t1 = time.time()
-                info(
-                    f"Skipped "
-                    f"{object_name} ({fmt_size(size)}) in {fmt_seconds(t1 - t0)}"
-                )
-                return False, t1 - t0
-
-        mime_type = mimetypes.guess_type(filepath)[0] or "binary/octet-stream"
-
-        if os.path.basename(filepath) == "service-worker.js":
-            cache_control = "no-cache"
-        else:
-            cache_control_seconds = DEFAULT_CACHE_CONTROL
-            if has_hashed_filename(filepath):
-                cache_control_seconds = HASHED_CACHE_CONTROL
-            cache_control = f"max-age={cache_control_seconds}, public"
-
-        s3.upload_file(
-            filepath,
-            config["name"],
-            object_name,
-            ExtraArgs={
-                "ACL": "public-read",
-                "ContentType": mime_type,
-                "CacheControl": cache_control,
-                "Metadata": {"filehash": file_hash},
-            },
-            Config=transfer_config,
-        )
-        t1 = time.time()
-        info(
-            f"{'Updated' if check_hash_first else 'Uploaded'} "
-            f"{object_name} ({fmt_size(size)}) in {fmt_seconds(t1 - t0)}"
-        )
-        return True, t1 - t0
 
     T0 = time.time()
     futures = {}
@@ -225,37 +188,28 @@ def upload_site(directory, config):
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=MAX_WORKERS_PARALLEL_UPLOADS
     ) as executor:
-        info(
-            "About to upload "
-            f"{len(to_upload_maybe) + len(to_upload_definitely):,} files"
-        )
-        # XXX avoid two loops!
-        for key, filepath, size, file_hash in to_upload_definitely:
-            futures[
-                executor.submit(
-                    _upload_file_maybe,
-                    s3,
-                    key,
-                    filepath,
-                    size,
-                    file_hash,
-                    config["name"],
-                    False,
-                )
-            ] = (key, filepath, size, file_hash)
-        for key, filepath, size, file_hash in to_upload_maybe:
-            futures[
-                executor.submit(
-                    _upload_file_maybe,
-                    s3,
-                    key,
-                    filepath,
-                    size,
-                    file_hash,
-                    config["name"],
-                    True,
-                )
-            ] = (key, filepath, size, file_hash)
+
+        if to_upload_maybe:
+            info("About to consider " f"{len(to_upload_maybe):,} files")
+        if to_upload_definitely:
+            info("About to upload " f"{len(to_upload_definitely):,} files")
+
+        bucket_name = config["name"]
+        for list_, check_hash_first in (
+            (to_upload_definitely, False),
+            (to_upload_maybe, True),
+        ):
+            for task in list_:
+                futures[
+                    executor.submit(
+                        _upload_file_maybe,
+                        s3,
+                        task,
+                        bucket_name,
+                        transfer_config,
+                        check_hash_first,
+                    )
+                ] = task
 
         for future in concurrent.futures.as_completed(futures):
             was_uploaded, took = future.result()
@@ -273,20 +227,13 @@ def upload_site(directory, config):
 
     if uploaded:
         if actually_uploaded:
-            total_uploaded_size = sum([x[2] for x in actually_uploaded])
+            total_uploaded_size = sum([x.size for x in actually_uploaded])
             success(
                 f"Uploaded {len(actually_uploaded):,} "
                 f"{'file' if len(actually_uploaded) == 1 else 'files'} "
                 f"(totalling {fmt_size(total_uploaded_size)}) "
                 f"(~{fmt_size(total_uploaded_size / 60)}/s)"
             )
-        # if actually_skipped:
-        #     total_skipped_size = sum([x[2] for x in actually_skipped])
-        #     success(
-        #         f"Skipped {len(actually_skipped):,} files "
-        #         f"(totalling {fmt_size(total_skipped_size)}) "
-        #         f"thanks to hash checking."
-        #     )
 
         if total_threadpool_time:
             info(
@@ -295,3 +242,58 @@ def upload_site(directory, config):
             )
 
     success(f"Done in {fmt_seconds(T1 - T0)}")
+
+    return {"uploaded": uploaded, "skipped": skipped, "took": T1 - T0}
+
+
+def _upload_file_maybe(s3, task, bucket_name, transfer_config, check_hash_first=False):
+    t0 = time.time()
+
+    if check_hash_first:
+        try:
+            object_data = s3.head_object(Bucket=bucket_name, Key=task.key)
+            if object_data["Metadata"].get("filehash") == task.file_hash:
+                # We can bail early!
+                t1 = time.time()
+                info(
+                    f"Skipped "
+                    f"{task.key} ({fmt_size(task.size)}) in {fmt_seconds(t1 - t0)}"
+                )
+                return False, t1 - t0
+        except ClientError as error:
+            # If a client error is thrown, then check that it was a 404 error.
+            # If it was a 404 error, then the bucket does not exist.
+            if error.response["Error"]["Code"] != "404":
+                raise
+
+            # If it really was a 404, it means that the method that gathered
+            # the existing list is out of sync.
+
+    mime_type = mimetypes.guess_type(task.file_path)[0] or "binary/octet-stream"
+
+    if os.path.basename(task.file_path) == "service-worker.js":
+        cache_control = "no-cache"
+    else:
+        cache_control_seconds = DEFAULT_CACHE_CONTROL
+        if _has_hashed_filename(task.file_path):
+            cache_control_seconds = HASHED_CACHE_CONTROL
+        cache_control = f"max-age={cache_control_seconds}, public"
+
+    s3.upload_file(
+        task.file_path,
+        bucket_name,
+        task.key,
+        ExtraArgs={
+            "ACL": "public-read",
+            "ContentType": mime_type,
+            "CacheControl": cache_control,
+            "Metadata": {"filehash": task.file_hash},
+        },
+        Config=transfer_config,
+    )
+    t1 = time.time()
+    info(
+        f"{'Updated' if check_hash_first else 'Uploaded'} "
+        f"{task.key} ({fmt_size(task.size)}) in {fmt_seconds(t1 - t0)}"
+    )
+    return True, t1 - t0

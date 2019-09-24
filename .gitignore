@@ -1,1 +1,3 @@
 stumptown_deployer.egg-info
+build/
+dist/
