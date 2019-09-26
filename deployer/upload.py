@@ -5,7 +5,6 @@ import hashlib
 import mimetypes
 import os
 import re
-import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,11 +27,6 @@ from .exceptions import NoGitDirectory
 from .utils import fmt_seconds, fmt_size, info, is_junk_file, ppath, success, warning
 
 hashed_filename_regex = re.compile(r"\.[a-f0-9]{8,32}\.")
-
-
-def center(msg):
-    t_width, _ = shutil.get_terminal_size(fallback=(80, 24))
-    warning(f"-----  {msg}  ".ljust(t_width, "-"))
 
 
 def _find_git_repo(start):
@@ -73,12 +67,17 @@ def upload_site(directory, config):
                 "which is needed to supply a default branchname."
             )
         active_branch = repo.active_branch
+        if active_branch == "master" and config["lifecycle_days"]:
+            warning(
+                f"Warning! You're setting a lifecycle_days "
+                f"({config['lifecycle_days']} days) on a build from a 'master' repo."
+            )
         config["name"] = DEFAULT_NAME_PATTERN.format(
             username=getpass.getuser(),
             branchname=active_branch.name,
             date=datetime.datetime.utcnow().strftime("%Y%m%d"),
         )
-    info(f"About to upload {ppath(directory)} to {config['name']}")
+    info(f"About to upload {ppath(directory)} to bucket {config['name']!r}")
 
     session = boto3.Session(profile_name=AWS_PROFILE)
     s3 = session.client("s3")
@@ -90,6 +89,7 @@ def upload_site(directory, config):
         # If a client error is thrown, then check that it was a 404 error.
         # If it was a 404 error, then the bucket does not exist.
         if error.response["Error"]["Code"] != "404":
+            print(error.response)
             raise
 
         # Needs to be created.
@@ -102,6 +102,22 @@ def upload_site(directory, config):
             CreateBucketConfiguration=bucket_config,
         )
 
+    if config["lifecycle_days"]:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3.html#S3.Client.put_bucket_lifecycle_configuration
+        # https://docs.aws.amazon.com/code-samples/latest/catalog/python-s3-put_bucket_lifecyle_configuration.py.html
+        s3.put_bucket_lifecycle_configuration(
+            Bucket=config["name"],
+            LifecycleConfiguration={
+                "Rules": [
+                    {
+                        "Expiration": {"Days": config["lifecycle_days"]},
+                        "Filter": {"Prefix": ""},
+                        "Status": "Enabled",
+                    }
+                ]
+            },
+        )
+
     try:
         website_bucket = s3.get_bucket_website(Bucket=config["name"])
     except ClientError as error:
@@ -109,13 +125,17 @@ def upload_site(directory, config):
             raise
         # Define the website configuration
         website_configuration = {
-            "ErrorDocument": {"Key": "error.html"},
+            "ErrorDocument": {"Key": "404.html"},
             "IndexDocument": {"Suffix": "index.html"},
+            "RoutingRules": [
+                {
+                    "Condition": {"KeyPrefixEquals": "/"},
+                    "Redirect": {"ReplaceKeyWith": "index.html"},
+                }
+            ],
         }
         website_bucket = s3.put_bucket_website(
-            Bucket=config["name"],
-            WebsiteConfiguration=website_configuration,
-            # XXX Would be nice to set expiration here
+            Bucket=config["name"], WebsiteConfiguration=website_configuration
         )
         info(f"Created website bucket called {config['name']}")
 
@@ -255,10 +275,8 @@ def _upload_file_maybe(s3, task, bucket_name, transfer_config, check_hash_first=
             if object_data["Metadata"].get("filehash") == task.file_hash:
                 # We can bail early!
                 t1 = time.time()
-                info(
-                    f"Skipped "
-                    f"{task.key} ({fmt_size(task.size)}) in {fmt_seconds(t1 - t0)}"
-                )
+                start = f"{fmt_size(task.size):} in {fmt_seconds(t1 - t0)}"
+                info(f"Skipped  {start:>19}  {task.key}")
                 return False, t1 - t0
         except ClientError as error:
             # If a client error is thrown, then check that it was a 404 error.
@@ -292,8 +310,7 @@ def _upload_file_maybe(s3, task, bucket_name, transfer_config, check_hash_first=
         Config=transfer_config,
     )
     t1 = time.time()
-    info(
-        f"{'Updated' if check_hash_first else 'Uploaded'} "
-        f"{task.key} ({fmt_size(task.size)}) in {fmt_seconds(t1 - t0)}"
-    )
+
+    start = f"{fmt_size(task.size)} in {fmt_seconds(t1 - t0)}"
+    info(f"{'Updated' if check_hash_first else 'Uploaded'} {start:>20}  {task.key}")
     return True, t1 - t0
