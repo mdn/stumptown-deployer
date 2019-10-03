@@ -42,8 +42,15 @@ def cli(ctx, debug):
     default=False,
     help="Ignores checking if files exist already",
 )
+@click.option(
+    "-l",
+    "--lifecycle-days",
+    required=False,
+    type=int,
+    help="If specified, the number of days until uploaded objects are deleted",
+)
 @click.argument("directory", type=click.Path())
-def upload(ctx, directory, name, refresh):
+def upload(ctx, directory, name, refresh, lifecycle_days):
     p = Path(directory)
     if not p.exists():
         error(f"{directory} does not exist")
@@ -51,6 +58,8 @@ def upload(ctx, directory, name, refresh):
 
     ctx.obj["name"] = name
     ctx.obj["refresh"] = refresh
+    ctx.obj["lifecycle_days"] = lifecycle_days
+    # print(ctx.obj)
     upload_site(directory, ctx.obj)
 
 
