@@ -40,19 +40,19 @@ def download_kuma_s3_bucket(destination: Path, s3url: str):
     total_cum_took = []
     total_size = []
     try:
+        t0 = time.time()
+        page = 1
         while True:
             # Have to do this so that 'ContinuationToken' can be omitted if falsy
             list_kwargs = dict(Bucket=bucket_name)
-            if prefix:
-                list_kwargs["Prefix"] = prefix
             if continuation_token:
                 list_kwargs["ContinuationToken"] = continuation_token
-
+            if prefix:
+                list_kwargs["Prefix"] = prefix
             # list_kwargs["MaxKeys"] = 100
 
             response = s3.list_objects_v2(**list_kwargs)
             objs = response.get("Contents", [])
-            # print(objs)
             todo = {}
             for obj in objs:
                 if obj["ETag"] not in downloaded_etags:
@@ -72,17 +72,19 @@ def download_kuma_s3_bucket(destination: Path, s3url: str):
                 new_etags.update(done)
 
                 print(
+                    f"(Page {page:>3}) "
                     f"Downloaded {len(todo):,} files ({fmt_size(size)}) "
                     f"in {fmt_time(took)} (distributed {fmt_time(cum_took)})"
                 )
             else:
-                print("Nothing to do with in this batch")
+                print(f"(Page {page:>3}) Nothing to do with in this batch")
 
             if response["IsTruncated"]:
                 continuation_token = response["NextContinuationToken"]
             else:
                 break
-            # break
+            page += 1
+        t1 = time.time()
     finally:
         if new_etags:
             print(f"Discovered {len(new_etags):,} NEW keys.")
@@ -105,7 +107,7 @@ def download_kuma_s3_bucket(destination: Path, s3url: str):
         else:
             print("No new keys downloaded.")
 
-    print(f"Total time {fmt_time(sum(total_took))}.")
+    print(f"Total time {fmt_time(t1 - t0)}.")
     print(f"Total download size {fmt_size(sum(total_size))}.")
 
 
@@ -118,9 +120,11 @@ def fmt_time(seconds):
 
 
 def fmt_size(b):
+    if b > 1024 * 1024 * 1024:
+        return f"{b / 1024 / 1024 / 1024:.1f}GB"
     if b > 1024 * 1024:
         return f"{b / 1024 / 1024:.1f}MB"
-    elif b > 1024:
+    if b > 1024:
         return f"{b / 1024:.1f}KB"
     return f"{b}B"
 
