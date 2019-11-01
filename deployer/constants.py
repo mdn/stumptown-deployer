@@ -18,7 +18,7 @@ S3_DEFAULT_BUCKET_LOCATION = config("S3_DEFAULT_BUCKET_LOCATION", default="")
 # If you use too many "workers" it might saturate your network meaning it's
 # slower.
 MAX_WORKERS_PARALLEL_UPLOADS = config(
-    "DEPLOYER_MAX_WORKERS_PARALLEL_UPLOADS", default=10, cast=int
+    "DEPLOYER_MAX_WORKERS_PARALLEL_UPLOADS", default=100, cast=int
 )
 
 
