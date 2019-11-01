@@ -72,17 +72,44 @@ def upload(ctx, directory, name, refresh, lifecycle_days):
     "--s3url", help="URL to S3 bucket", default="s3://mdn-api-prod/", show_default=True
 )
 @click.option(
+    "-s",
+    "--searchfilter",
+    help="string that must appear in S3 key",
+    default="",
+    multiple=True,
+)
+@click.option(
     "--check-for-existence",
     help="Even if ETag is in the cache file, check that the destination file exists",
     default=False,
     show_default=True,
     is_flag=True,
 )
+@click.option(
+    "--refresh",
+    default=False,
+    help="Ignores checking if files exist already or is cached",
+    show_default=True,
+    is_flag=True,
+)
 @click.argument("destination", type=click.Path())
-def kumadownload(ctx, destination, s3url, check_for_existence=False):
+def kumadownload(
+    ctx,
+    destination,
+    s3url,
+    searchfilter: (str) = (),
+    check_for_existence=False,
+    refresh=False,
+):
     p = Path(destination)
     p.is_dir() or p.mkdir()
-    download_kuma_s3_bucket(p, s3url, check_for_existence=check_for_existence)
+    download_kuma_s3_bucket(
+        p,
+        s3url,
+        searchfilter=searchfilter,
+        check_for_existence=check_for_existence,
+        refresh=refresh,
+    )
 
 
 @cli.command()

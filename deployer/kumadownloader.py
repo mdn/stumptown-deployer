@@ -1,16 +1,21 @@
-import hashlib
-import json
-import time
-from urllib.parse import urlparse
-from pathlib import Path
 import concurrent.futures
+import time
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import boto3
+from botocore.exceptions import ClientError
 
 from .constants import AWS_PROFILE, MAX_WORKERS_PARALLEL_KUMADOWNLOADS
 
 
-def download_kuma_s3_bucket(destination: Path, s3url: str, check_for_existence=False):
+def download_kuma_s3_bucket(
+    destination: Path,
+    s3url: str,
+    searchfilter: (str) = (),
+    check_for_existence=False,
+    refresh=False,
+):
     session = boto3.Session(profile_name=AWS_PROFILE)
     s3 = session.client("s3")
     url_parsed = urlparse(s3url)
@@ -25,13 +30,16 @@ def download_kuma_s3_bucket(destination: Path, s3url: str, check_for_existence=F
     try:
         with open(etags_cache_file) as f:
             for line in f:
-                etag, rel_path = line.split()
+                etag, rel_path = line.strip().split("\t", 1)
                 downloaded_etags[etag] = rel_path
     except FileNotFoundError:
         # Starting afresh!
         pass
 
-    print(f"We know of {len(downloaded_etags):,} downloaded etags.")
+    if refresh:
+        print("Ignoring any downloaded etags.")
+    else:
+        print(f"We know of {len(downloaded_etags):,} downloaded etags.")
 
     def exists(rel_path):
         return (destination / rel_path).exists()
@@ -59,13 +67,19 @@ def download_kuma_s3_bucket(destination: Path, s3url: str, check_for_existence=F
             todo = {}
             for obj in objs:
                 key, etag = obj["Key"], obj["ETag"]
+                if searchfilter:
+                    # Skip this one unless one of the searchfilters match.
+                    if not any([x in key for x in searchfilter]):
+                        continue
 
                 # There's only about 5 of these in existence.
                 # https://github.com/mdn/kuma/issues/6076
                 key = key.replace("//", "/")
 
-                if etag not in downloaded_etags or (
-                    check_for_existence and not exists(downloaded_etags[etag])
+                if (
+                    refresh
+                    or etag not in downloaded_etags
+                    or (check_for_existence and not exists(downloaded_etags[etag]))
                 ):
                     todo[key] = etag
 
@@ -149,23 +163,12 @@ def download(s3, bucket_name, destination, todo, max_workers=None):
     # First create all the necessary directories
     directories: {Path} = set()
     for key in todo:
-        directories.add(destination / Path(key).parent)
+        directories.add(destination / Path(unquote(key)).parent)
 
     # Do this synchronously first to avoid race conditions, in the thread pool,
     # of trying to create the same directory.
-    too_long_directories = {}
     for directory in directories:
-        try:
-            directory.mkdir(exist_ok=True, parents=True)
-        except OSError:
-            # Replace every portion of the directory that is too large
-            new_directory = destination
-            for part in directory.relative_to(destination).parts:
-                if len(part) > 100:
-                    part = hashlib.md5(part.encode("utf-8")).hexdigest()[:12]
-                new_directory /= part
-            too_long_directories[directory] = new_directory
-            new_directory.mkdir(exist_ok=True, parents=True)
+        directory.mkdir(exist_ok=True, parents=True)
 
     futures = {}
     total_threadpool_time = []
@@ -173,14 +176,7 @@ def download(s3, bucket_name, destination, todo, max_workers=None):
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         for key in todo:
             futures[
-                executor.submit(
-                    _download_file,
-                    s3,
-                    bucket_name,
-                    key,
-                    destination,
-                    too_long_directories,
-                )
+                executor.submit(_download_file, s3, bucket_name, key, destination)
             ] = key
 
         for future in concurrent.futures.as_completed(futures):
@@ -195,43 +191,16 @@ def download(s3, bucket_name, destination, todo, max_workers=None):
     return done, T1 - T0, sum(total_threadpool_time), sum(total_threadpool_size)
 
 
-def _download_file(
-    s3,
-    bucket_name: str,
-    key: str,
-    destination: Path,
-    too_long_directories,
-    too_long_name=100,
-):
+def _download_file(s3, bucket_name: str, key: str, destination: Path):
     t0 = time.time()
-    file_destination = destination / Path(key)
-    rewrote = False
-    if file_destination.parent in too_long_directories:
-        file_destination = (
-            too_long_directories[file_destination.parent] / Path(key).name
-        )
-        rewrote = True
-
-    too_long = len(file_destination.name) > too_long_name
-
-    if too_long:
-        # Need to come up with a shorter name
-        parts = file_destination.parts
-        too_long_name = parts[-1]
-        suffix = file_destination.suffix
-        new_prefix_name = hashlib.md5(too_long_name.encode("utf-8")).hexdigest()[:12]
-        new_name = f"{new_prefix_name}{suffix}"
-        file_destination = file_destination.parent.joinpath(new_name)
-        rewrote = True
-
+    file_destination = destination / Path(unquote(key))
     with open(file_destination, "wb") as f:
-        s3.download_fileobj(bucket_name, key, f)
-
-    if rewrote:
-        with open(file_destination, "r") as f:
-            data = json.load(f)
-            data["_original_key"] = key
-        with open(file_destination, "w") as f:
-            json.dump(data, f)
+        try:
+            s3.download_fileobj(bucket_name, key, f)
+        except ClientError as error:
+            if error.response["Error"]["Code"] == "404":
+                print(f"Warning! Key {key} no longer exists in the bucket. Ignoring.")
+            else:
+                raise
     t1 = time.time()
     return file_destination, t1 - t0
