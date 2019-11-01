@@ -10,7 +10,7 @@ import boto3
 from .constants import AWS_PROFILE, MAX_WORKERS_PARALLEL_KUMADOWNLOADS
 
 
-def download_kuma_s3_bucket(destination: Path, s3url: str):
+def download_kuma_s3_bucket(destination: Path, s3url: str, check_for_existence=False):
     session = boto3.Session(profile_name=AWS_PROFILE)
     s3 = session.client("s3")
     url_parsed = urlparse(s3url)
@@ -32,6 +32,9 @@ def download_kuma_s3_bucket(destination: Path, s3url: str):
         pass
 
     print(f"We know of {len(downloaded_etags):,} downloaded etags.")
+
+    def exists(rel_path):
+        return (destination / rel_path).exists()
 
     new_etags = {}
 
@@ -55,8 +58,16 @@ def download_kuma_s3_bucket(destination: Path, s3url: str):
             objs = response.get("Contents", [])
             todo = {}
             for obj in objs:
-                if obj["ETag"] not in downloaded_etags:
-                    todo[obj["Key"]] = obj["ETag"]
+                key, etag = obj["Key"], obj["ETag"]
+
+                # There's only about 5 of these in existence.
+                # https://github.com/mdn/kuma/issues/6076
+                key = key.replace("//", "/")
+
+                if etag not in downloaded_etags or (
+                    check_for_existence and not exists(downloaded_etags[etag])
+                ):
+                    todo[key] = etag
 
             if todo:
                 done, took, cum_took, size = download(
@@ -159,7 +170,6 @@ def download(s3, bucket_name, destination, todo, max_workers=None):
     futures = {}
     total_threadpool_time = []
     total_threadpool_size = []
-    # uploaded = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         for key in todo:
             futures[
@@ -216,6 +226,7 @@ def _download_file(
 
     with open(file_destination, "wb") as f:
         s3.download_fileobj(bucket_name, key, f)
+
     if rewrote:
         with open(file_destination, "r") as f:
             data = json.load(f)
