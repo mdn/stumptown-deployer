@@ -7,9 +7,9 @@ implementation detail.
 
 ## Limitations and caveats
 
-* Redirects
+- Redirects
 
-* GitHub integration
+- GitHub integration
 
 ## Getting started
 
@@ -21,6 +21,14 @@ float fancy.
 
 Please refer to the [`boto3` documentation](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/quickstart.html#configuration) with regards to configuring AWS access
 credentials.
+
+### Downloading Kuma
+
+If you're building from Kuma's Document JSON API you can use:
+
+    stumptown-deployer kumadownload destination
+
+It will print the path to every new file downloaded.
 
 ## Goal
 
