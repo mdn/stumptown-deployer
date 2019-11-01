@@ -39,9 +39,11 @@ def cli(ctx, debug):
     "--name", default=None, help=f"Name of the site (default {DEFAULT_NAME_PATTERN!r})"
 )
 @click.option(
-    "--refresh/--no-refresh",
+    "--refresh",
     default=False,
     help="Ignores checking if files exist already",
+    show_default=True,
+    is_flag=True,
 )
 @click.option(
     "-l",
@@ -69,11 +71,18 @@ def upload(ctx, directory, name, refresh, lifecycle_days):
 @click.option(
     "--s3url", help="URL to S3 bucket", default="s3://mdn-api-prod/", show_default=True
 )
+@click.option(
+    "--check-for-existence",
+    help="Even if ETag is in the cache file, check that the destination file exists",
+    default=False,
+    show_default=True,
+    is_flag=True,
+)
 @click.argument("destination", type=click.Path())
-def kumadownload(ctx, destination, s3url):
+def kumadownload(ctx, destination, s3url, check_for_existence=False):
     p = Path(destination)
     p.is_dir() or p.mkdir()
-    download_kuma_s3_bucket(p, s3url)
+    download_kuma_s3_bucket(p, s3url, check_for_existence=check_for_existence)
 
 
 @cli.command()
