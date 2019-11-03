@@ -42,17 +42,23 @@ def _has_hashed_filename(fn):
     return hashed_filename_regex.findall(os.path.basename(fn))
 
 
-@dataclass(unsafe_hash=True)
+# @dataclass(unsafe_hash=True)
+@dataclass()
 class UploadTask:
     """All the relevant information for doing an upload"""
 
     key: str
-    file_path: str
+    file_path: Path
     size: int
     file_hash: str
+    needs_hash_check: bool
 
     def __repr__(self):
         return repr(self.key)
+
+    def set_file_hash(self):
+        with open(self.file_path, "rb") as f:
+            self.file_hash = hashlib.md5(f.read()).hexdigest()
 
 
 def upload_site(directory, config):
@@ -164,25 +170,49 @@ def upload_site(directory, config):
         warning(f"{len(uploaded_already):,} files already uploaded.")
 
     transfer_config = TransferConfig()
-    skipped = []
+    # skipped = []
+    skipped = 0
 
-    to_upload_maybe = []
-    to_upload_definitely = []
-    for fp in directory.glob("**/*.*"):
-        key = str(fp.relative_to(directory))
-        # name = str(fp)
-        size = os.stat(fp).st_size
-        with open(fp, "rb") as f:
-            file_hash = hashlib.md5(f.read()).hexdigest()
-        task = UploadTask(key, str(fp), size, file_hash)
+    # to_upload_maybe = []
+    # to_upload_definitely = []
+
+    # Use this pattern in case there's a file without extension.
+    # for fp in directory.glob("**/*"):
+    # if fp.is_dir():
+    #     # E.g. /pl/Web/API/docs/WindowBase64.atob/ which is
+    #     continue
+    counts = {"uploaded": 0, "not_uploaded": 0}
+
+    total_size = []
+
+    def update_uploaded_stats(stats):
+        counts["uploaded"] += stats["counts"].get("uploaded")
+        counts["not_uploaded"] += stats["counts"].get("not_uploaded")
+        total_size.append(stats["total_size_uploaded"])
+
+    T0 = time.time()
+    total_count = 0
+    batch = []
+    for fp in pwalk(directory):
         if is_junk_file(fp):
-            skipped.append(task)
+            skipped += 1
             continue
+        # This assumes  that it can saved in S3 as a key that is the filename.
+        key_path = fp.relative_to(directory)
+        if key_path.name == "index.redirect":
+            # Call these index.html when they go into S3
+            key_path = key_path.parent / "index.html"
+        key = str(key_path)
 
+        size = fp.stat().st_size
+        # with open(fp, "rb") as f:
+        #     file_hash = hashlib.md5(f.read()).hexdigest()
+        task = UploadTask(key, fp, size, None, False)
         if key not in uploaded_already or uploaded_already[key]["Size"] != size:
             # No doubt! We definitely didn't have this before or it's definitely
             # different.
-            to_upload_definitely.append(task)
+            batch.append(task)
+
         else:
             # At this point, the key exists and the size hasn't changed.
             # However, for some files, that's not conclusive.
@@ -197,79 +227,113 @@ def upload_site(directory, config):
             # However, for files that are already digest hashed, we don't need
             # to bother checking.
             if _has_hashed_filename(key):
-                skipped.append(task)
+                # skipped.append(task)
+                skipped += 1
+                continue
             else:
-                to_upload_maybe.append(task)
+                task.needs_hash_check = True
+                batch.append(task)
 
+        if len(batch) >= 1000:
+            # Fire off these
+            update_uploaded_stats(_start_uploads(s3, config, batch, transfer_config))
+            total_count += len(batch)
+            batch = []
+
+    if batch:
+        update_uploaded_stats(_start_uploads(s3, config, batch, transfer_config))
+        total_count += len(batch)
+
+    T1 = time.time()
+    print(counts)
+    success(f"Uploaded {fmt_size(sum(total_size))}.")
+    success(f"Done in {fmt_seconds(T1 - T0)}.")
+
+
+def _start_uploads(s3, config, batch, transfer_config):
     T0 = time.time()
     futures = {}
     total_threadpool_time = []
-    uploaded = {}
+    # uploaded = {}
+    counts = {"uploaded": 0, "not_uploaded": 0}
+    total_size_uploaded = 0
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=MAX_WORKERS_PARALLEL_UPLOADS
     ) as executor:
 
-        if to_upload_maybe:
-            info("About to consider " f"{len(to_upload_maybe):,} files")
-        if to_upload_definitely:
-            info("About to upload " f"{len(to_upload_definitely):,} files")
+        # if to_upload_maybe:
+        #     info("About to consider " f"{len(to_upload_maybe):,} files")
+        # if to_upload_definitely:
+        #     info("About to upload " f"{len(to_upload_definitely):,} files")
 
         bucket_name = config["name"]
-        for list_, check_hash_first in (
-            (to_upload_definitely, False),
-            (to_upload_maybe, True),
-        ):
-            for task in list_:
-                futures[
-                    executor.submit(
-                        _upload_file_maybe,
-                        s3,
-                        task,
-                        bucket_name,
-                        transfer_config,
-                        check_hash_first,
-                    )
-                ] = task
+        # for list_, check_hash_first in (
+        #     (to_upload_definitely, False),
+        #     (to_upload_maybe, True),
+        # ):
+        for task in batch:
+            futures[
+                executor.submit(
+                    _upload_file_maybe, s3, task, bucket_name, transfer_config
+                )
+            ] = task
 
         for future in concurrent.futures.as_completed(futures):
             was_uploaded, took = future.result()
             task = futures[future]
-            uploaded[task] = (was_uploaded, took)
+            # uploaded[task] = (was_uploaded, took)
             total_threadpool_time.append(took)
+            if was_uploaded:
+                counts["uploaded"] += 1
+            else:
+                counts["not_uploaded"] += 1
 
     T1 = time.time()
 
-    actually_uploaded = [k for k, v in uploaded.items() if v[0]]
-    actually_skipped = [k for k, v in uploaded.items() if not v[0]]
+    # actually_uploaded = [k for k, v in uploaded.items() if v[0]]
+    # actually_skipped = [k for k, v in uploaded.items() if not v[0]]
 
-    if skipped or actually_skipped:
-        warning(f"Skipped uploading {len(skipped) + len(actually_skipped):,} files")
+    # if skipped or actually_skipped:
+    #     warning(f"Skipped uploading {len(skipped) + len(actually_skipped):,} files")
 
-    if uploaded:
-        if actually_uploaded:
-            total_uploaded_size = sum([x.size for x in actually_uploaded])
-            success(
-                f"Uploaded {len(actually_uploaded):,} "
-                f"{'file' if len(actually_uploaded) == 1 else 'files'} "
-                f"(totalling {fmt_size(total_uploaded_size)}) "
-                f"(~{fmt_size(total_uploaded_size / 60)}/s)"
-            )
+    # if uploaded:
+    #     if actually_uploaded:
+    #         total_uploaded_size = sum([x.size for x in actually_uploaded])
+    #         success(
+    #             f"Uploaded {len(actually_uploaded):,} "
+    #             f"{'file' if len(actually_uploaded) == 1 else 'files'} "
+    #             f"(totalling {fmt_size(total_uploaded_size)}) "
+    #             f"(~{fmt_size(total_uploaded_size / 60)}/s)"
+    #         )
 
-        if total_threadpool_time:
-            info(
-                "Sum of time to upload in thread pool "
-                f"{fmt_seconds(sum(total_threadpool_time))}"
-            )
+    #     if total_threadpool_time:
+    #         info(
+    #             "Sum of time to upload in thread pool "
+    #             f"{fmt_seconds(sum(total_threadpool_time))}"
+    #         )
 
-    success(f"Done in {fmt_seconds(T1 - T0)}")
+    return {
+        "counts": counts,
+        "took": T1 - T0,
+        "total_time": sum(total_threadpool_time),
+        "total_size_uploaded": total_size_uploaded,
+    }
 
-    return {"uploaded": uploaded, "skipped": skipped, "took": T1 - T0}
+
+def pwalk(start):
+    for entry in os.scandir(start):
+        if entry.is_dir():
+            for p in pwalk(entry):
+                yield p
+        else:
+            yield Path(entry)
 
 
-def _upload_file_maybe(s3, task, bucket_name, transfer_config, check_hash_first=False):
+def _upload_file_maybe(s3, task, bucket_name, transfer_config):
     t0 = time.time()
-
-    if check_hash_first:
+    if not task.file_hash:
+        task.set_file_hash()
+    if task.needs_hash_check:
         try:
             object_data = s3.head_object(Bucket=bucket_name, Key=task.key)
             if object_data["Metadata"].get("filehash") == task.file_hash:
@@ -287,7 +351,7 @@ def _upload_file_maybe(s3, task, bucket_name, transfer_config, check_hash_first=
             # If it really was a 404, it means that the method that gathered
             # the existing list is out of sync.
 
-    mime_type = mimetypes.guess_type(task.file_path)[0] or "binary/octet-stream"
+    mime_type = mimetypes.guess_type(str(task.file_path))[0] or "binary/octet-stream"
 
     if os.path.basename(task.file_path) == "service-worker.js":
         cache_control = "no-cache"
@@ -297,20 +361,28 @@ def _upload_file_maybe(s3, task, bucket_name, transfer_config, check_hash_first=
             cache_control_seconds = HASHED_CACHE_CONTROL
         cache_control = f"max-age={cache_control_seconds}, public"
 
+    ExtraArgs = {
+        "ACL": "public-read",
+        "ContentType": mime_type,
+        "CacheControl": cache_control,
+        "Metadata": {"filehash": task.file_hash},
+    }
+    if task.file_path.name == "index.redirect":
+        with open(task.file_path) as f:
+            redirect_url = f.read().strip()
+            ExtraArgs["WebsiteRedirectLocation"] = redirect_url
+
     s3.upload_file(
-        task.file_path,
+        str(task.file_path),
         bucket_name,
         task.key,
-        ExtraArgs={
-            "ACL": "public-read",
-            "ContentType": mime_type,
-            "CacheControl": cache_control,
-            "Metadata": {"filehash": task.file_hash},
-        },
+        ExtraArgs=ExtraArgs,
         Config=transfer_config,
     )
     t1 = time.time()
 
     start = f"{fmt_size(task.size)} in {fmt_seconds(t1 - t0)}"
-    info(f"{'Updated' if check_hash_first else 'Uploaded'} {start:>20}  {task.key}")
+    info(
+        f"{'Updated' if task.needs_hash_check else 'Uploaded'} {start:>20}  {task.key}"
+    )
     return True, t1 - t0
