@@ -175,25 +175,35 @@ def upload_site(directory, config):
 
     # to_upload_maybe = []
     # to_upload_definitely = []
-    batch = []
+
     # Use this pattern in case there's a file without extension.
     # for fp in directory.glob("**/*"):
     # if fp.is_dir():
     #     # E.g. /pl/Web/API/docs/WindowBase64.atob/ which is
     #     continue
-    all_uploaded = {"new": 0, "unchanged": 0}
+    counts = {"uploaded": 0, "not_uploaded": 0}
+
+    total_size = []
+
+    def update_uploaded_stats(stats):
+        counts["uploaded"] += stats["counts"].get("uploaded")
+        counts["not_uploaded"] += stats["counts"].get("not_uploaded")
+        total_size.append(stats["total_size_uploaded"])
 
     T0 = time.time()
     total_count = 0
+    batch = []
     for fp in pwalk(directory):
         if is_junk_file(fp):
             skipped += 1
             continue
         # This assumes  that it can saved in S3 as a key that is the filename.
         key_path = fp.relative_to(directory)
+        if key_path.name == "index.redirect":
+            # Call these index.html when they go into S3
+            key_path = key_path.parent / "index.html"
         key = str(key_path)
 
-        print("KEY:", key)
         size = fp.stat().st_size
         # with open(fp, "rb") as f:
         #     file_hash = hashlib.md5(f.read()).hexdigest()
@@ -224,21 +234,20 @@ def upload_site(directory, config):
                 task.needs_hash_check = True
                 batch.append(task)
 
-        if len(batch) >= MAX_WORKERS_PARALLEL_UPLOADS:
+        if len(batch) >= 1000:
             # Fire off these
-            uploaded = _start_uploads(s3, config, batch, transfer_config)
+            update_uploaded_stats(_start_uploads(s3, config, batch, transfer_config))
             total_count += len(batch)
             batch = []
 
     if batch:
-        uploaded = _start_uploads(s3, config, batch, transfer_config)
-        print(uploaded)
-        print(all_uploaded)
-        raise Exception
+        update_uploaded_stats(_start_uploads(s3, config, batch, transfer_config))
         total_count += len(batch)
 
     T1 = time.time()
-    success(f"Done in {fmt_seconds(T1 - T0)}")
+    print(counts)
+    success(f"Uploaded {fmt_size(sum(total_size))}.")
+    success(f"Done in {fmt_seconds(T1 - T0)}.")
 
 
 def _start_uploads(s3, config, batch, transfer_config):
@@ -322,10 +331,9 @@ def pwalk(start):
 
 def _upload_file_maybe(s3, task, bucket_name, transfer_config):
     t0 = time.time()
-
+    if not task.file_hash:
+        task.set_file_hash()
     if task.needs_hash_check:
-        if not task.file_hash:
-            task.set_file_hash()
         try:
             object_data = s3.head_object(Bucket=bucket_name, Key=task.key)
             if object_data["Metadata"].get("filehash") == task.file_hash:
@@ -362,7 +370,6 @@ def _upload_file_maybe(s3, task, bucket_name, transfer_config):
     if task.file_path.name == "index.redirect":
         with open(task.file_path) as f:
             redirect_url = f.read().strip()
-            print(task.key, "REDIRECTS TO", redirect_url)
             ExtraArgs["WebsiteRedirectLocation"] = redirect_url
 
     s3.upload_file(
