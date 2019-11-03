@@ -153,6 +153,7 @@ def upload_site(directory, config):
     if config["refresh"]:
         info("Refresh, so ignoring what was previously uploaded.")
     else:
+        t0 = time.time()
         continuation_token = None
         while True:
             # Have to do this so that 'ContinuationToken' can be omitted if falsy
@@ -167,7 +168,11 @@ def upload_site(directory, config):
             else:
                 break
 
-        warning(f"{len(uploaded_already):,} files already uploaded.")
+        t1 = time.time()
+        warning(
+            f"{len(uploaded_already):,} files already uploaded "
+            f"(took {fmt_seconds(t1 - t0)} to figure that out)."
+        )
 
     transfer_config = TransferConfig()
     skipped = 0
@@ -180,6 +185,14 @@ def upload_site(directory, config):
         counts["uploaded"] += stats["counts"].get("uploaded")
         counts["not_uploaded"] += stats["counts"].get("not_uploaded")
         total_size.append(stats["total_size_uploaded"])
+
+    def print_progress():
+        msg = f"{counts['uploaded']:,} files uploaded. "
+        if counts["not_uploaded"]:
+            msg += f"{counts['not_uploaded']:,} files not uploaded. "
+        if skipped:
+            msg += f"{skipped:,} files skipped."
+        info(msg.strip())
 
     T0 = time.time()
     total_count = 0
@@ -230,10 +243,12 @@ def upload_site(directory, config):
             update_uploaded_stats(_start_uploads(s3, config, batch, transfer_config))
             total_count += len(batch)
             batch = []
+            print_progress()
 
     if batch:
         update_uploaded_stats(_start_uploads(s3, config, batch, transfer_config))
         total_count += len(batch)
+        print_progress()
 
     T1 = time.time()
     print(counts)
