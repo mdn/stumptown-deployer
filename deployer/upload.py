@@ -153,6 +153,7 @@ def upload_site(directory, config):
     if config["refresh"]:
         info("Refresh, so ignoring what was previously uploaded.")
     else:
+        t0 = time.time()
         continuation_token = None
         while True:
             # Have to do this so that 'ContinuationToken' can be omitted if falsy
@@ -167,20 +168,15 @@ def upload_site(directory, config):
             else:
                 break
 
-        warning(f"{len(uploaded_already):,} files already uploaded.")
+        t1 = time.time()
+        warning(
+            f"{len(uploaded_already):,} files already uploaded "
+            f"(took {fmt_seconds(t1 - t0)} to figure that out)."
+        )
 
     transfer_config = TransferConfig()
-    # skipped = []
     skipped = 0
 
-    # to_upload_maybe = []
-    # to_upload_definitely = []
-
-    # Use this pattern in case there's a file without extension.
-    # for fp in directory.glob("**/*"):
-    # if fp.is_dir():
-    #     # E.g. /pl/Web/API/docs/WindowBase64.atob/ which is
-    #     continue
     counts = {"uploaded": 0, "not_uploaded": 0}
 
     total_size = []
@@ -189,6 +185,14 @@ def upload_site(directory, config):
         counts["uploaded"] += stats["counts"].get("uploaded")
         counts["not_uploaded"] += stats["counts"].get("not_uploaded")
         total_size.append(stats["total_size_uploaded"])
+
+    def print_progress():
+        msg = f"{counts['uploaded']:,} files uploaded. "
+        if counts["not_uploaded"]:
+            msg += f"{counts['not_uploaded']:,} files not uploaded. "
+        if skipped:
+            msg += f"{skipped:,} files skipped."
+        info(msg.strip())
 
     T0 = time.time()
     total_count = 0
@@ -239,10 +243,12 @@ def upload_site(directory, config):
             update_uploaded_stats(_start_uploads(s3, config, batch, transfer_config))
             total_count += len(batch)
             batch = []
+            print_progress()
 
     if batch:
         update_uploaded_stats(_start_uploads(s3, config, batch, transfer_config))
         total_count += len(batch)
+        print_progress()
 
     T1 = time.time()
     print(counts)
@@ -260,21 +266,17 @@ def _start_uploads(s3, config, batch, transfer_config):
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=MAX_WORKERS_PARALLEL_UPLOADS
     ) as executor:
-
-        # if to_upload_maybe:
-        #     info("About to consider " f"{len(to_upload_maybe):,} files")
-        # if to_upload_definitely:
-        #     info("About to upload " f"{len(to_upload_definitely):,} files")
-
         bucket_name = config["name"]
-        # for list_, check_hash_first in (
-        #     (to_upload_definitely, False),
-        #     (to_upload_maybe, True),
-        # ):
+        quiet = config["quiet"]
         for task in batch:
             futures[
                 executor.submit(
-                    _upload_file_maybe, s3, task, bucket_name, transfer_config
+                    _upload_file_maybe,
+                    s3,
+                    task,
+                    bucket_name,
+                    transfer_config,
+                    quiet=quiet,
                 )
             ] = task
 
@@ -289,28 +291,6 @@ def _start_uploads(s3, config, batch, transfer_config):
                 counts["not_uploaded"] += 1
 
     T1 = time.time()
-
-    # actually_uploaded = [k for k, v in uploaded.items() if v[0]]
-    # actually_skipped = [k for k, v in uploaded.items() if not v[0]]
-
-    # if skipped or actually_skipped:
-    #     warning(f"Skipped uploading {len(skipped) + len(actually_skipped):,} files")
-
-    # if uploaded:
-    #     if actually_uploaded:
-    #         total_uploaded_size = sum([x.size for x in actually_uploaded])
-    #         success(
-    #             f"Uploaded {len(actually_uploaded):,} "
-    #             f"{'file' if len(actually_uploaded) == 1 else 'files'} "
-    #             f"(totalling {fmt_size(total_uploaded_size)}) "
-    #             f"(~{fmt_size(total_uploaded_size / 60)}/s)"
-    #         )
-
-    #     if total_threadpool_time:
-    #         info(
-    #             "Sum of time to upload in thread pool "
-    #             f"{fmt_seconds(sum(total_threadpool_time))}"
-    #         )
 
     return {
         "counts": counts,
@@ -329,7 +309,7 @@ def pwalk(start):
             yield Path(entry)
 
 
-def _upload_file_maybe(s3, task, bucket_name, transfer_config):
+def _upload_file_maybe(s3, task, bucket_name, transfer_config, quiet=False):
     t0 = time.time()
     if not task.file_hash:
         task.set_file_hash()
@@ -339,8 +319,9 @@ def _upload_file_maybe(s3, task, bucket_name, transfer_config):
             if object_data["Metadata"].get("filehash") == task.file_hash:
                 # We can bail early!
                 t1 = time.time()
-                start = f"{fmt_size(task.size):} in {fmt_seconds(t1 - t0)}"
-                info(f"Skipped  {start:>19}  {task.key}")
+                if not quiet:
+                    start = f"{fmt_size(task.size):} in {fmt_seconds(t1 - t0)}"
+                    info(f"{'Skipped':<9} {start:>19} {task.key}")
                 return False, t1 - t0
         except ClientError as error:
             # If a client error is thrown, then check that it was a 404 error.
@@ -381,8 +362,10 @@ def _upload_file_maybe(s3, task, bucket_name, transfer_config):
     )
     t1 = time.time()
 
-    start = f"{fmt_size(task.size)} in {fmt_seconds(t1 - t0)}"
-    info(
-        f"{'Updated' if task.needs_hash_check else 'Uploaded'} {start:>20}  {task.key}"
-    )
+    if not quiet:
+        start = f"{fmt_size(task.size)} in {fmt_seconds(t1 - t0)}"
+        info(
+            f"{'Updated' if task.needs_hash_check else 'Uploaded':<9} "
+            f"{start:>20} {task.key}"
+        )
     return True, t1 - t0
