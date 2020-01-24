@@ -3,6 +3,7 @@ import datetime
 import getpass
 import hashlib
 import mimetypes
+import shutil
 import os
 import re
 import time
@@ -21,9 +22,8 @@ from .constants import (
     DEFAULT_NAME_PATTERN,
     HASHED_CACHE_CONTROL,
     MAX_WORKERS_PARALLEL_UPLOADS,
-    S3_DEFAULT_BUCKET_LOCATION,
 )
-from .exceptions import NoGitDirectory
+from .exceptions import NoGitDirectory, CantDryRunError
 from .utils import fmt_seconds, fmt_size, info, is_junk_file, ppath, success, warning
 
 hashed_filename_regex = re.compile(r"\.[a-f0-9]{8,32}\.")
@@ -42,7 +42,6 @@ def _has_hashed_filename(fn):
     return hashed_filename_regex.findall(os.path.basename(fn))
 
 
-# @dataclass(unsafe_hash=True)
 @dataclass()
 class UploadTask:
     """All the relevant information for doing an upload"""
@@ -83,14 +82,20 @@ def upload_site(directory, config):
             branchname=active_branch.name,
             date=datetime.datetime.utcnow().strftime("%Y%m%d"),
         )
-    info(f"About to upload {ppath(directory)} to bucket {config['name']!r}")
+        if not config.replace("-", "").strip():
+            raise ValueError("Empty prefix name")
+    info(
+        f"About to upload {ppath(directory)} to prefix {config['name']!r} "
+        f"into bucket {config['bucket']!r}"
+    )
 
     session = boto3.Session(profile_name=AWS_PROFILE)
     s3 = session.client("s3")
 
     # First make sure the bucket exists
     try:
-        s3.head_bucket(Bucket=config["name"])
+        s3.head_bucket(Bucket=config["bucket"])
+        info(f"Bucket {config['bucket']!r} exists")
     except ClientError as error:
         # If a client error is thrown, then check that it was a 404 error.
         # If it was a 404 error, then the bucket does not exist.
@@ -100,32 +105,43 @@ def upload_site(directory, config):
 
         # Needs to be created.
         bucket_config = {}
-        if S3_DEFAULT_BUCKET_LOCATION:
-            bucket_config["LocationConstraint"] = "us-west-1"
+        if config["bucket_location"]:
+            bucket_config["LocationConstraint"] = config["bucket_location"]
+        if config["dry_run"]:
+            raise CantDryRunError(
+                f"The bucket ({config['bucket']} doesn't exist and won't be created "
+                "in dry-run mode. But it needs to exist to be able to find out "
+                "what files already exist."
+            )
         s3.create_bucket(
-            Bucket=config["name"],
+            Bucket=config["bucket"],
             ACL="public-read",
             CreateBucketConfiguration=bucket_config,
         )
+        info(f"Bucket {config['bucket']!r} created")
 
-    if config["lifecycle_days"]:
-        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3.html#S3.Client.put_bucket_lifecycle_configuration
-        # https://docs.aws.amazon.com/code-samples/latest/catalog/python-s3-put_bucket_lifecyle_configuration.py.html
-        s3.put_bucket_lifecycle_configuration(
-            Bucket=config["name"],
-            LifecycleConfiguration={
-                "Rules": [
-                    {
-                        "Expiration": {"Days": config["lifecycle_days"]},
-                        "Filter": {"Prefix": ""},
-                        "Status": "Enabled",
-                    }
-                ]
-            },
-        )
+        if config["bucket_lifecycle_days"]:
+            # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3.html#S3.Client.put_bucket_lifecycle_configuration
+            # https://docs.aws.amazon.com/code-samples/latest/catalog/python-s3-put_bucket_lifecyle_configuration.py.html
+            s3.put_bucket_lifecycle_configuration(
+                Bucket=config["bucket"],
+                LifecycleConfiguration={
+                    "Rules": [
+                        {
+                            "Expiration": {"Days": config["bucket_lifecycle_days"]},
+                            "Filter": {"Prefix": ""},
+                            "Status": "Enabled",
+                        }
+                    ]
+                },
+            )
+            info(
+                f"Bucket lifecycle expiration of "
+                f"{config['bucket_lifecycle_days']!r} days configured."
+            )
 
     try:
-        website_bucket = s3.get_bucket_website(Bucket=config["name"])
+        website_bucket = s3.get_bucket_website(Bucket=config["bucket"])
     except ClientError as error:
         if error.response["Error"]["Code"] != "NoSuchWebsiteConfiguration":
             raise
@@ -141,9 +157,9 @@ def upload_site(directory, config):
             ],
         }
         website_bucket = s3.put_bucket_website(
-            Bucket=config["name"], WebsiteConfiguration=website_configuration
+            Bucket=config["bucket"], WebsiteConfiguration=website_configuration
         )
-        info(f"Created website bucket called {config['name']}")
+        info(f"Created bucket website configuration for {config['bucket']!r}")
 
     if config["debug"]:
         info(f"Website bucket: {website_bucket!r}")
@@ -153,11 +169,15 @@ def upload_site(directory, config):
     if config["refresh"]:
         info("Refresh, so ignoring what was previously uploaded.")
     else:
+        info(
+            f"Gather complete list of existing uploads under prefix "
+            f"{config['name']!r}..."
+        )
         t0 = time.time()
         continuation_token = None
         while True:
             # Have to do this so that 'ContinuationToken' can be omitted if falsy
-            list_kwargs = dict(Bucket=config["name"])
+            list_kwargs = dict(Bucket=config["bucket"], Prefix=config["name"])
             if continuation_token:
                 list_kwargs["ContinuationToken"] = continuation_token
             response = s3.list_objects_v2(**list_kwargs)
@@ -167,46 +187,91 @@ def upload_site(directory, config):
                 continuation_token = response["NextContinuationToken"]
             else:
                 break
-
         t1 = time.time()
+
         warning(
             f"{len(uploaded_already):,} files already uploaded "
-            f"(took {fmt_seconds(t1 - t0)} to figure that out)."
+            f"(took {fmt_seconds(t1 - t0)})."
         )
 
+    total_todo = 0
+    t0 = time.time()
+    for fp in pwalk(directory):
+        if is_junk_file(fp):
+            continue
+        if fp.name.startswith("_"):
+            continue
+        total_todo += 1
+    t1 = time.time()
+    warning(
+        f"{total_todo:,} files to be (maybe) uploaded "
+        f"(took {fmt_seconds(t1 - t0)})."
+    )
+
     transfer_config = TransferConfig()
+
+    # Number of files that don't need to be uploaded because they are already uploaded
+    # with a difference.
     skipped = 0
 
+    # Number of files we deliberate chose to NOT upload. Or even attempt to.
+    ignored = 0
+
+    # Use this pattern in case there's a file without extension.
+    # for fp in directory.glob("**/*"):
+    # if fp.is_dir():
+    #     # E.g. /pl/Web/API/docs/WindowBase64.atob/ which is
+    #     continue
     counts = {"uploaded": 0, "not_uploaded": 0}
 
     total_size = []
+    total_time = []
 
     def update_uploaded_stats(stats):
         counts["uploaded"] += stats["counts"].get("uploaded")
         counts["not_uploaded"] += stats["counts"].get("not_uploaded")
         total_size.append(stats["total_size_uploaded"])
+        total_time.append(stats["total_time"])
+        if not config["no_progress_bar"]:
+            done = counts["uploaded"] + counts["not_uploaded"]
+            percentage = 100 * done / total_todo
+            max_bar_width = shutil.get_terminal_size((80, 20)).columns
+            bar_width = int(max_bar_width * done / total_todo)
+            print(
+                f"{done:,} of {total_todo:,}".ljust(20)
+                + f"[{'▋' * bar_width:<{max_bar_width}}] "
+                f"{percentage:.1f}%\r",
+                end="",
+            )
 
-    def print_progress():
-        msg = f"{counts['uploaded']:,} files uploaded. "
-        if counts["not_uploaded"]:
-            msg += f"{counts['not_uploaded']:,} files not uploaded. "
-        if skipped:
-            msg += f"{skipped:,} files skipped."
-        info(msg.strip())
-
-    T0 = time.time()
     total_count = 0
     batch = []
+
+    if config["no_progress_bar"]:
+        log = info
+    else:
+
+        current_log_file_name = "upload.log"
+        info(f"Logging progress into {current_log_file_name}")
+
+        def log(line):
+            with open(current_log_file_name, "a") as f:
+                f.write(f"{line}\n")
+
+    T0 = time.time()
     for fp in pwalk(directory):
         if is_junk_file(fp):
-            skipped += 1
+            ignored += 1
+            continue
+        if fp.name.startswith("_"):
+            ignored += 1
             continue
         # This assumes  that it can saved in S3 as a key that is the filename.
         key_path = fp.relative_to(directory)
-        if key_path.name == "index.redirect":
-            # Call these index.html when they go into S3
-            key_path = key_path.parent / "index.html"
-        key = str(key_path)
+        # if key_path.name == "index.redirect":
+        #     # Call these index.html when they go into S3
+        #     key_path = key_path.parent / "index.html"
+        key = f"{config['name']}/{key_path}"
 
         size = fp.stat().st_size
         # with open(fp, "rb") as f:
@@ -240,34 +305,49 @@ def upload_site(directory, config):
 
         if len(batch) >= 1000:
             # Fire off these
-            update_uploaded_stats(_start_uploads(s3, config, batch, transfer_config))
+            update_uploaded_stats(
+                _start_uploads(
+                    s3,
+                    config,
+                    batch,
+                    transfer_config,
+                    log=log,
+                    dry_run=config["dry_run"],
+                )
+            )
             total_count += len(batch)
             batch = []
-            print_progress()
 
     if batch:
-        update_uploaded_stats(_start_uploads(s3, config, batch, transfer_config))
+        update_uploaded_stats(
+            _start_uploads(
+                s3, config, batch, transfer_config, log=log, dry_run=config["dry_run"]
+            )
+        )
         total_count += len(batch)
-        print_progress()
 
     T1 = time.time()
-    print(counts)
+    success(
+        f"{counts['uploaded']:,} files uploaded, "
+        f"{counts['not_uploaded']:,} files didn't need to be uploaded."
+    )
+    info(f"Total thread-pool time: {fmt_seconds(sum(total_time))}")
     success(f"Uploaded {fmt_size(sum(total_size))}.")
+    if config["dry_run"]:
+        warning("Remember! In dry-run mode")
     success(f"Done in {fmt_seconds(T1 - T0)}.")
 
 
-def _start_uploads(s3, config, batch, transfer_config):
+def _start_uploads(s3, config, batch, transfer_config, log=info, dry_run=False):
     T0 = time.time()
     futures = {}
     total_threadpool_time = []
-    # uploaded = {}
     counts = {"uploaded": 0, "not_uploaded": 0}
     total_size_uploaded = 0
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=MAX_WORKERS_PARALLEL_UPLOADS
     ) as executor:
-        bucket_name = config["name"]
-        quiet = config["quiet"]
+        bucket_name = config["bucket"]
         for task in batch:
             futures[
                 executor.submit(
@@ -276,17 +356,19 @@ def _start_uploads(s3, config, batch, transfer_config):
                     task,
                     bucket_name,
                     transfer_config,
-                    quiet=quiet,
+                    log=log,
+                    dry_run=dry_run,
                 )
             ] = task
 
         for future in concurrent.futures.as_completed(futures):
             was_uploaded, took = future.result()
             task = futures[future]
-            # uploaded[task] = (was_uploaded, took)
             total_threadpool_time.append(took)
             if was_uploaded:
                 counts["uploaded"] += 1
+                print(f"Adding {task.size} to total_size_uploaded")
+                total_size_uploaded += task.size
             else:
                 counts["not_uploaded"] += 1
 
@@ -309,7 +391,7 @@ def pwalk(start):
             yield Path(entry)
 
 
-def _upload_file_maybe(s3, task, bucket_name, transfer_config, quiet=False):
+def _upload_file_maybe(s3, task, bucket_name, transfer_config, log=info, dry_run=False):
     t0 = time.time()
     if not task.file_hash:
         task.set_file_hash()
@@ -319,13 +401,12 @@ def _upload_file_maybe(s3, task, bucket_name, transfer_config, quiet=False):
             if object_data["Metadata"].get("filehash") == task.file_hash:
                 # We can bail early!
                 t1 = time.time()
-                if not quiet:
-                    start = f"{fmt_size(task.size):} in {fmt_seconds(t1 - t0)}"
-                    info(f"{'Skipped':<9} {start:>19} {task.key}")
+                start = f"{fmt_size(task.size):} in {fmt_seconds(t1 - t0)}"
+                log(f"Skipped  {start:>19}  {task.key}")
                 return False, t1 - t0
         except ClientError as error:
             # If a client error is thrown, then check that it was a 404 error.
-            # If it was a 404 error, then the bucket does not exist.
+            # If it was a 404 error, then the key does not exist.
             if error.response["Error"]["Code"] != "404":
                 raise
 
@@ -348,24 +429,20 @@ def _upload_file_maybe(s3, task, bucket_name, transfer_config, quiet=False):
         "CacheControl": cache_control,
         "Metadata": {"filehash": task.file_hash},
     }
-    if task.file_path.name == "index.redirect":
-        with open(task.file_path) as f:
-            redirect_url = f.read().strip()
-            ExtraArgs["WebsiteRedirectLocation"] = redirect_url
-
-    s3.upload_file(
-        str(task.file_path),
-        bucket_name,
-        task.key,
-        ExtraArgs=ExtraArgs,
-        Config=transfer_config,
-    )
+    # if task.file_path.name == "index.redirect":
+    #     with open(task.file_path) as f:
+    #         redirect_url = f.read().strip()
+    #         ExtraArgs["WebsiteRedirectLocation"] = redirect_url
+    if not dry_run:
+        s3.upload_file(
+            str(task.file_path),
+            bucket_name,
+            task.key,
+            ExtraArgs=ExtraArgs,
+            Config=transfer_config,
+        )
     t1 = time.time()
 
-    if not quiet:
-        start = f"{fmt_size(task.size)} in {fmt_seconds(t1 - t0)}"
-        info(
-            f"{'Updated' if task.needs_hash_check else 'Uploaded':<9} "
-            f"{start:>20} {task.key}"
-        )
+    start = f"{fmt_size(task.size)} in {fmt_seconds(t1 - t0)}"
+    log(f"{'Updated' if task.needs_hash_check else 'Uploaded'} {start:>20}  {task.key}")
     return True, t1 - t0

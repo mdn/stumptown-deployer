@@ -53,6 +53,9 @@ def fmt_size(bytes_):
 def fmt_seconds(seconds):
     if seconds < 1:
         return f"{seconds * 1000:.1f}ms"
-    if seconds > 1000:
+    if seconds >= 60 * 60:
+        minutes = seconds / 60
+        return f"{int(minutes) // 60}h{int(minutes) % 60}m"
+    if seconds >= 60:
         return f"{int(seconds) // 60}m{int(seconds) % 60}s"
     return f"{seconds:.1f}s"
